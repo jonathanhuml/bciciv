@@ -1,0 +1,18 @@
+# Data files
+*.mat
+*.pt
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.edf
+*.gdf
+*.fif
+*.set
+*.eeg
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
