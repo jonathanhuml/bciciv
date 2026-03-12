@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -265,9 +266,8 @@ def extract_luna_features(model: nn.Module, X: torch.Tensor) -> np.ndarray:
 
 # ── ZUNA ───────────────────────────────────────────────────────────────────────
 
-def load_zuna() -> tuple[nn.Module, int]:
-    """Returns (encoder, latent_dim). Encoder is frozen, eval, on DEVICE."""
-    import json
+def load_zuna() -> tuple[nn.Module, nn.Module, int]:
+    """Returns (encoder, enc_dec, latent_dim). Both are frozen, eval, on DEVICE."""
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file as safe_load
     from lingua.args import dataclass_from_dict
@@ -292,16 +292,63 @@ def load_zuna() -> tuple[nn.Module, int]:
     latent_dim = model_args.encoder_output_dim
 
     n_enc = sum(p.numel() for p in encoder.parameters())
+    n_dec = sum(p.numel() for p in enc_dec.parameters()) - n_enc
     print(f"  ZUNA encoder — latent_dim={latent_dim}, params={n_enc:,}")
+    print(f"  ZUNA decoder — params={n_dec:,}")
     print(f"  ZUNA encoder raw output: (1, B×{ZUNA_SEQ_LEN}, {latent_dim})")
     print(f"  After time-pool per channel: (B, {N_CHANS}, {ZUNA_N_COARSE}, {latent_dim})"
           f" → mean(dim=2) → (B, {N_CHANS}, {latent_dim})"
           f" → flatten → (B, {N_CHANS * latent_dim})")
 
-    for p in encoder.parameters():
+    for p in enc_dec.parameters():
         p.requires_grad_(False)
-    encoder.eval()
-    return encoder.to(DEVICE), latent_dim
+    enc_dec.eval()
+
+    _explore_zuna_shapes(enc_dec, latent_dim)
+
+    return encoder.to(DEVICE), enc_dec.to(DEVICE), latent_dim
+
+
+def _explore_zuna_shapes(enc_dec: nn.Module, latent_dim: int) -> None:
+    """
+    Run a single dummy window through the ZUNA encoder to verify shapes.
+    Prints encoder output shape and catches any forward-pass errors early.
+    """
+    from apps.AY2latent_bci.eeg_data import chop_and_reshape_signals
+
+    print("\n  [ZUNA shape check] Running dummy forward pass …")
+    try:
+        dummy_eeg  = torch.zeros(N_CHANS, N_TIMES, dtype=torch.float32)
+        dummy_pos  = torch.zeros(N_CHANS, 3, dtype=torch.float32)
+        dummy_disc = torch.zeros(N_CHANS, 3, dtype=torch.long)
+
+        eeg_r, _, cpd_r, _, tc_r, seq_len = chop_and_reshape_signals(
+            eeg_signal        = dummy_eeg,
+            chan_pos          = dummy_pos,
+            chan_pos_discrete = dummy_disc,
+            chan_dropout      = [],
+            tf                = ZUNA_N_FINE,
+            use_coarse_time   = "B",
+        )
+        packed_tokens = eeg_r.unsqueeze(0)                              # (1, SEQ_LEN, N_FINE)
+        tok_idx       = torch.cat([cpd_r, tc_r], dim=1).unsqueeze(0)   # (1, SEQ_LEN, 4)
+        seq_lens      = torch.tensor([int(seq_len)], dtype=torch.long)
+
+        print(f"  Dummy packed_tokens: {packed_tokens.shape}"
+              f"  (1, ZUNA_SEQ_LEN={ZUNA_SEQ_LEN}, ZUNA_N_FINE={ZUNA_N_FINE})")
+
+        with torch.no_grad():
+            enc_out, _ = enc_dec.encoder(
+                token_values=packed_tokens,
+                seq_lens=seq_lens,
+                tok_idx=tok_idx,
+                attn_impl="flex_attention",
+            )
+            print(f"  Encoder output shape: {enc_out.shape}"
+                  f"  (1, B×{ZUNA_SEQ_LEN}, latent_dim={latent_dim})")
+    except Exception as e:
+        print(f"  Shape check failed: {e}")
+    print()
 
 
 class _BCICIVZUNADataset(Dataset):
@@ -381,20 +428,12 @@ def extract_zuna_features(
         seq_lens      = seq_lens.to(DEVICE)
         tok_idx       = tok_idx.to(DEVICE)
 
-        try:
-            enc_out, _ = encoder(
-                token_values=packed_tokens,
-                seq_lens=seq_lens,
-                tok_idx=tok_idx,
-                attn_impl="flex_attention",
-            )
-        except Exception:
-            enc_out, _ = encoder(
-                token_values=packed_tokens,
-                seq_lens=seq_lens,
-                tok_idx=tok_idx,
-                attn_impl="sdpa",
-            )
+        enc_out, _ = encoder(
+            token_values=packed_tokens,
+            seq_lens=seq_lens,
+            tok_idx=tok_idx,
+            attn_impl="flex_attention",
+        )
 
         if not printed_shape:
             print(f"  ZUNA encoder raw output: {enc_out.shape}"
@@ -654,15 +693,25 @@ def main() -> None:
     zuna_enc_feats = None
     if not args.skip_zuna:
         print("\n[ZUNA] Extracting frozen encoder features …")
+        zuna_enc = zuna_encdec = None
         try:
-            chan_pos, chan_pos_disc = make_bciciv_chan_pos()
-            zuna_enc, _            = load_zuna()
-            zuna_enc_feats = extract_zuna_features(zuna_enc, X, chan_pos, chan_pos_disc)
-            print(f"  ZUNAenc feature shape: {zuna_enc_feats.shape}")
-            del zuna_enc
-            torch.cuda.empty_cache()
+            chan_pos, chan_pos_disc   = make_bciciv_chan_pos()
+            zuna_enc, zuna_encdec, _ = load_zuna()
         except Exception as e:
-            print(f"  ZUNA skipped — {e}")
+            print(f"  ZUNA load failed — {e}")
+
+        if zuna_enc is not None:
+            try:
+                zuna_enc_feats = extract_zuna_features(zuna_enc, X, chan_pos, chan_pos_disc)
+                print(f"  ZUNAenc feature shape: {zuna_enc_feats.shape}")
+            except Exception as e:
+                import traceback
+                print(f"  ZUNAenc failed — {type(e).__name__}: {e}")
+                traceback.print_exc()
+
+        if zuna_enc is not None or zuna_encdec is not None:
+            del zuna_enc, zuna_encdec
+            torch.cuda.empty_cache()
 
     # ── Evaluation ─────────────────────────────────────────────────────────────
     print(f"\n[EVAL] {N_FOLDS}-fold stratified CV — 4-class motor imagery")

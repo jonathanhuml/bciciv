@@ -1,0 +1,3 @@
+method,dataset,balanced_acc_mean,balanced_acc_std,accuracy_mean,accuracy_std,fold_1_bal_acc,fold_2_bal_acc,fold_3_bal_acc,fold_4_bal_acc,fold_5_bal_acc,fold_1_acc,fold_2_acc,fold_3_acc,fold_4_acc,fold_5_acc
+PSD+PCA+LogReg,BCICIV_2a,0.273457,0.008297,0.273422,0.008236,0.284137,0.282342,0.268376,0.269413,0.263016,0.284043,0.282215,0.268371,0.269436,0.263046
+LUNA+LogReg,BCICIV_2a,0.276199,0.008144,0.276192,0.008108,0.278785,0.279043,0.287598,0.272546,0.263025,0.278723,0.27902,0.28754,0.27263,0.263046
